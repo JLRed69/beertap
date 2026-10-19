@@ -196,9 +196,14 @@ function ScanView({ bus, beer, onCancel, onUser }) {
   }, [bus.state.users]);
 
   // Try camera
+  const usersRef = useRef(bus.state.users);
+  const onUserRef = useRef(onUser);
+  usersRef.current = bus.state.users;
+  onUserRef.current = onUser;
+  const [scanMsg, setScanMsg] = useState(null);
   useEffect(() => {
     stoppedRef.current = false;
-    let stream;
+    let stream, lastMiss = 0;
     (async () => {
       if (typeof jsQR === 'undefined') {
         setUsingFakeScan(true); return;
@@ -225,36 +230,39 @@ function ScanView({ bus, beer, onCancel, onUser }) {
       if (stoppedRef.current) return;
       const v = videoRef.current, c = canvasRef.current;
       if (v && c && v.readyState >= 2) {
-        const w = v.videoWidth, h = v.videoHeight;
-        if (w && h) {
+        const vw = v.videoWidth, vh = v.videoHeight;
+        if (vw && vh) {
+          const w = 360, h = Math.round(360 * vh / vw);
           c.width = w; c.height = h;
           const ctx = c.getContext('2d', { willReadFrequently: true });
           ctx.drawImage(v, 0, 0, w, h);
           const data = ctx.getImageData(0, 0, w, h);
-          const code = jsQR(data.data, w, h, { inversionAttempts: 'dontInvert' });
+          const code = jsQR(data.data, w, h, { inversionAttempts: 'attemptBoth' });
           if (code && code.data) {
-            const m = /^beertap:([^:]+)(?::([^:]+))?$/.exec(code.data.trim());
-            if (m) {
-              const uid = m[1];
-              if (bus.state.users[uid]) {
-                stoppedRef.current = true;
-                navigator.vibrate && navigator.vibrate(80);
-                onUser(uid);
-                return;
-              }
+            const m = /^beertap:([^:]+)/.exec(code.data.trim());
+            const uid = m && m[1];
+            if (uid && usersRef.current[uid]) {
+              stoppedRef.current = true;
+              navigator.vibrate && navigator.vibrate(80);
+              onUserRef.current(uid);
+              return;
+            }
+            if (Date.now() - lastMiss > 2500) {
+              lastMiss = Date.now();
+              setScanMsg(uid ? `QR leído, pero ese usuario no existe en el cuarto "${bus.room}". Abre la app del cliente con el mismo cuarto.` : 'Ese QR no es de BeerTap.');
             }
           }
         }
       }
-      rafRef.current = requestAnimationFrame(tick);
+      rafRef.current = setTimeout(tick, 150);
     }
 
     return () => {
       stoppedRef.current = true;
-      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      if (rafRef.current) clearTimeout(rafRef.current);
       if (stream) stream.getTracks().forEach(t => t.stop());
     };
-  }, [bus.state.users, onUser]);
+  }, []);
 
   return (
     <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column', padding: '36px 16px 20px' }}>
@@ -293,7 +301,7 @@ function ScanView({ bus, beer, onCancel, onUser }) {
         <canvas ref={canvasRef} style={{ display: 'none' }}/>
         {/* scan line */}
         <div style={{
-          position: 'absolute', left: 0, right: 0, height: 32,
+          position: 'absolute', left: 0, right: 0, top: 0, height: 32,
           background: 'linear-gradient(180deg, transparent, rgba(245,166,35,0.55), transparent)',
           animation: 'scanLine 1.8s ease-in-out infinite alternate', pointerEvents: 'none',
         }}/>
@@ -314,9 +322,9 @@ function ScanView({ bus, beer, onCancel, onUser }) {
 
       <div style={{
         marginTop: 14, textAlign: 'center',
-        fontSize: 12, color: 'rgba(248,241,227,0.55)', lineHeight: 1.4,
+        fontSize: 12, color: scanMsg ? '#F87171' : 'rgba(248,241,227,0.55)', lineHeight: 1.4,
       }}>
-        Muestra el QR de tu app a la cámara
+        {scanMsg || 'Muestra el QR de tu app a la cámara'}
       </div>
 
       {/* Fallback: pick a user (when camera fails or for testing) */}

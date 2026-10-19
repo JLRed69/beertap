@@ -140,7 +140,7 @@ input.field::placeholder { color: var(--ink-mute); }
                       100% { transform: translateY(-220px) scale(1.4); opacity: 0; } }
 @keyframes shimmerY { 0%,100% { transform: translateY(0) scaleX(1); }
                       50% { transform: translateY(-1.5px) scaleX(1.01); } }
-@keyframes scanLine { 0% { transform: translateY(-100%); } 100% { transform: translateY(100%); } }
+@keyframes scanLine { 0% { transform: translateY(-8px); } 100% { transform: translateY(196px); } }
 @keyframes glowPulse{ 0%,100% { box-shadow: 0 0 0 0 rgba(245,166,35,0.4), 0 10px 30px rgba(245,166,35,0.2); }
                       50%     { box-shadow: 0 0 0 18px rgba(245,166,35,0), 0 10px 30px rgba(245,166,35,0.35); } }
 @keyframes fadeUp   { 0% { transform: translateY(10px); } 100% { transform: translateY(0); } }
