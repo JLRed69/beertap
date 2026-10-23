@@ -75,7 +75,7 @@ function applyAction(state, action, opts = {}) {
   switch (action.type) {
     case 'CREATE_USER': {
       const { user } = action;
-      next.users = { ...state.users, [user.id]: { ...user, createdAt: user.createdAt || now } };
+      next.users = { ...state.users, [user.id]: { initialBalance: user.balance, ...user, createdAt: user.createdAt || now } };
       next.transactions = [
         { id: newId('tx'), ts: now, type: 'signup', userId: user.id, by, note: 'Cuenta creada' },
         ...state.transactions,
@@ -86,9 +86,11 @@ function applyAction(state, action, opts = {}) {
       const u = state.users[action.userId];
       if (!u) return state;
       const newBal = Math.max(0, u.balance + action.delta);
+      const applied = newBal - u.balance;
+      if (!applied) return state;
       next.users = { ...state.users, [action.userId]: { ...u, balance: newBal } };
       next.transactions = [
-        { id: newId('tx'), ts: now, type: action.delta > 0 ? 'topup' : 'admin_adjust', userId: action.userId, amount: action.delta, by, note: action.note || '' },
+        { id: newId('tx'), ts: now, type: applied > 0 ? 'topup' : 'admin_adjust', userId: action.userId, amount: applied, by, note: action.note || '' },
         ...state.transactions,
       ];
       return next;
@@ -133,12 +135,53 @@ function applyAction(state, action, opts = {}) {
       }
       return next;
     }
+    case 'UPDATE_PROFILE': {
+      const u = state.users[action.userId];
+      if (!u) return state;
+      next.users = { ...state.users, [action.userId]: { ...u, ...action.patch } };
+      return next;
+    }
     case 'RESET': {
-      return { ...INITIAL_STATE(), version: state.version + 1, lastEditedAt: now, lastEditedBy: by };
+      return { ...INITIAL_STATE(), epoch: now, version: state.version + 1, lastEditedAt: now, lastEditedBy: by };
     }
     default:
       return state;
   }
+}
+
+/* ---------- Merge (no se pierden altas/servidas simultáneas) ---------- */
+function isNewerState(a, b) {
+  return a.version > b.version || (a.version === b.version && a.lastEditedAt > b.lastEditedAt);
+}
+function mergeStates(local, inc) {
+  const le = local.epoch || 0, ie = inc.epoch || 0;
+  if (le !== ie) return ie > le ? inc : local;
+  const tx = new Map();
+  [...(inc.transactions || []), ...(local.transactions || [])].forEach(t => { if (!tx.has(t.id)) tx.set(t.id, t); });
+  const transactions = [...tx.values()].sort((a, b) => b.ts - a.ts);
+  const users = { ...(local.users || {}), ...(inc.users || {}) };
+  const sums = {};
+  transactions.forEach(t => { if (t.amount) sums[t.userId] = (sums[t.userId] || 0) + t.amount; });
+  Object.keys(users).forEach(id => {
+    const u = users[id];
+    if (typeof u.initialBalance === 'number') users[id] = { ...u, balance: Math.max(0, u.initialBalance + (sums[id] || 0)) };
+  });
+  const rq = new Map();
+  [...(local.rechargeRequests || []), ...(inc.rechargeRequests || [])].forEach(r => {
+    const p = rq.get(r.id);
+    if (!p || (p.status === 'pending' && r.status !== 'pending')) rq.set(r.id, r);
+  });
+  const base = isNewerState(inc, local) ? inc : local;
+  return {
+    ...base, users, transactions,
+    rechargeRequests: [...rq.values()].sort((a, b) => b.ts - a.ts),
+    version: Math.max(local.version, inc.version),
+    lastEditedAt: Math.max(local.lastEditedAt || 0, inc.lastEditedAt || 0),
+  };
+}
+function stateSig(s) {
+  return [s.epoch || 0, Object.keys(s.users || {}).length, (s.transactions || []).length,
+    (s.rechargeRequests || []).filter(r => r.status !== 'pending').length, (s.rechargeRequests || []).length].join('|');
 }
 
 /* ---------- The Bus hook ---------- */
@@ -153,11 +196,21 @@ function useBus(room = 'demo', clientName = 'unknown') {
   const [connStatus, setConnStatus] = useState('connecting'); // connecting | online | offline
   const clientRef = useRef(null);
   const stateRef = useRef(state);
+  const avKey = 'beertap.avatars.' + room;
+  const [avatars, setAvatars] = useState(() => {
+    try { return JSON.parse(localStorage.getItem(avKey)) || {}; } catch (_) { return {}; }
+  });
+  const avatarsRef = useRef(avatars);
+  const saveAvatars = (next) => {
+    avatarsRef.current = next; setAvatars(next);
+    try { localStorage.setItem(avKey, JSON.stringify(next)); } catch (_) {}
+  };
 
   // keep ref hot
   useEffect(() => { stateRef.current = state; }, [state]);
 
   const topic = `beertap/${room}/state`;
+  const avPrefix = `beertap/${room}/avatar/`;
 
   /* MQTT connection */
   useEffect(() => {
@@ -182,9 +235,22 @@ function useBus(room = 'demo', clientName = 'unknown') {
       }
       clientRef.current = client;
 
+      let gotState = false;
+      const seenAv = new Set();
       client.on('connect', () => {
         setConnStatus('online');
-        client.subscribe(topic, { qos: 0 });
+        client.subscribe([topic, avPrefix + '+'], { qos: 0 });
+        // Si el broker perdió los datos, este dispositivo los vuelve a publicar.
+        setTimeout(() => {
+          if (!gotState && stateRef.current.version > 0) {
+            client.publish(topic, JSON.stringify(stateRef.current), { qos: 0, retain: true });
+          }
+          if (clientName === 'admin') {
+            Object.keys(avatarsRef.current).forEach(uid => {
+              if (!seenAv.has(uid)) client.publish(avPrefix + uid, avatarsRef.current[uid], { qos: 0, retain: true });
+            });
+          }
+        }, 3000);
       });
       client.on('reconnect', () => setConnStatus('connecting'));
       client.on('offline',   () => setConnStatus('connecting'));
@@ -199,18 +265,31 @@ function useBus(room = 'demo', clientName = 'unknown') {
         }
       });
       client.on('message', (t, payload) => {
+        if (t.indexOf(avPrefix) === 0) {
+          const uid = t.slice(avPrefix.length), img = payload.toString();
+          seenAv.add(uid);
+          if (avatarsRef.current[uid] === img) return;
+          const next = { ...avatarsRef.current };
+          if (img) next[uid] = img; else delete next[uid];
+          saveAvatars(next);
+          return;
+        }
         if (t !== topic) return;
+        gotState = true;
         try {
           const incoming = JSON.parse(payload.toString());
           if (!incoming || typeof incoming.version !== 'number') return;
           const local = stateRef.current;
-          // Adopt incoming if newer (higher version, or same version + newer timestamp)
-          const isNewer = incoming.version > local.version ||
-            (incoming.version === local.version && incoming.lastEditedAt > local.lastEditedAt);
-          if (isNewer) {
-            stateRef.current = incoming;
-            setState(incoming);
-            try { localStorage.setItem('beertap.state.' + room, JSON.stringify(incoming)); } catch(_){}
+          let merged = mergeStates(local, incoming);
+          const sigM = stateSig(merged);
+          if (sigM !== stateSig(incoming) && merged !== incoming) {
+            merged = { ...merged, version: merged.version + 1, lastEditedAt: Date.now(), lastEditedBy: clientName };
+            client.publish(topic, JSON.stringify(merged), { qos: 0, retain: true });
+          }
+          if (merged !== local && (sigM !== stateSig(local) || isNewerState(merged, local))) {
+            stateRef.current = merged;
+            setState(merged);
+            try { localStorage.setItem('beertap.state.' + room, JSON.stringify(merged)); } catch(_){}
           }
         } catch (e) {
           console.warn('bad payload', e);
@@ -232,13 +311,23 @@ function useBus(room = 'demo', clientName = 'unknown') {
     stateRef.current = next;
     setState(next);
     try { localStorage.setItem('beertap.state.' + room, JSON.stringify(next)); } catch (_) {}
-    if (clientRef.current && clientRef.current.connected) {
+    if (clientRef.current) {
       try {
         clientRef.current.publish(topic, JSON.stringify(next), { qos: 0, retain: true });
       } catch (_) {}
     }
     return next;
   }, [room, topic, clientName]);
+
+  /* Selfie (≈5 KB) en su propio topic retenido, fuera del estado */
+  const publishAvatar = useCallback((uid, dataUrl) => {
+    const next = { ...avatarsRef.current };
+    if (dataUrl) next[uid] = dataUrl; else delete next[uid];
+    saveAvatars(next);
+    if (clientRef.current) {
+      try { clientRef.current.publish(avPrefix + uid, dataUrl || '', { qos: 0, retain: true }); } catch (_) {}
+    }
+  }, [avPrefix]);
 
   /* Ephemeral pour notifications (not part of state) */
   const sendPourCommand = useCallback((cmd) => {
@@ -249,7 +338,7 @@ function useBus(room = 'demo', clientName = 'unknown') {
     }
   }, [room]);
 
-  return { state, dispatch, connStatus, room, clientName, sendPourCommand };
+  return { state, dispatch, connStatus, room, clientName, sendPourCommand, avatars, publishAvatar };
 }
 
 /* ---------- Local-only login session ---------- */
@@ -286,5 +375,5 @@ function fmtTime(ts)   {
 Object.assign(window, {
   useBus, useSession, BEERS_LIVE, SIZES_LIVE,
   hashpw, newId, findBeer, fmtMoney, fmtTime,
-  applyAction, INITIAL_STATE,
+  applyAction, INITIAL_STATE, mergeStates,
 });
